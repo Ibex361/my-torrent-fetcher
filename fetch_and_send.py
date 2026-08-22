@@ -23,6 +23,12 @@ import glob
 import subprocess
 import asyncio
 
+# Force unbuffered stdout so print() statements show up immediately in the
+# GitHub Actions log instead of being buffered and appearing in delayed
+# chunks (this was making long-running steps like compression look frozen
+# even though they were working fine underneath).
+sys.stdout.reconfigure(line_buffering=True)
+
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
@@ -205,10 +211,12 @@ def compress_video(input_path: str) -> str:
     original_mb = os.path.getsize(input_path) / (1024 * 1024)
 
     # Get total duration first, so we can compute a % complete
+    print("Checking video duration...")
     duration_seconds = _get_video_duration(input_path)
     dur_str = f"{duration_seconds/60:.1f} min" if duration_seconds else "unknown length"
     print(f"=== COMPRESSING === {input_path} ({original_mb:.1f} MB, {dur_str}) -> x265, CRF {CRF}")
     print("(this can take a while — progress updates below every ~10s)")
+    print("Starting ffmpeg...")
 
     cmd = [
         "ffmpeg",
@@ -239,18 +247,30 @@ def compress_video(input_path: str) -> str:
             bufsize=1,
         )
 
-        for line in process.stdout:
-            line = line.strip()
-            if line.startswith("out_time_ms="):
-                try:
-                    current_out_time = int(line.split("=")[1]) / 1_000_000
-                except ValueError:
-                    pass
-            elif line.startswith("speed="):
-                current_speed = line.split("=")[1]
+        import select
+
+        while True:
+            # Wait up to 10s for new output; if none arrives, we still get
+            # a chance to print a heartbeat below instead of blocking silently.
+            ready, _, _ = select.select([process.stdout], [], [], 10)
+
+            if ready:
+                line = process.stdout.readline()
+                if line == "":
+                    if process.poll() is not None:
+                        break
+                    continue
+                line = line.strip()
+                if line.startswith("out_time_ms="):
+                    try:
+                        current_out_time = int(line.split("=")[1]) / 1_000_000
+                    except ValueError:
+                        pass
+                elif line.startswith("speed="):
+                    current_speed = line.split("=")[1]
 
             now = time.time()
-            if now - last_print >= 10:  # print every ~10 seconds, not every line
+            if now - last_print >= 10:
                 last_print = now
                 elapsed_min = (now - start_time) / 60
                 if duration_seconds:
@@ -259,6 +279,9 @@ def compress_video(input_path: str) -> str:
                     print(f"  [compress] {pct:.0f}% | speed {current_speed or '?'} | elapsed {elapsed_min:.1f}m | ETA ~{eta_min:.1f}m")
                 else:
                     print(f"  [compress] {current_out_time/60:.1f} min encoded | speed {current_speed or '?'} | elapsed {elapsed_min:.1f}m")
+
+            if process.poll() is not None:
+                break
 
         returncode = process.wait(timeout=COMPRESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
