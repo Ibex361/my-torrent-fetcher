@@ -1,0 +1,37 @@
+name: Fetch Torrent and Send to Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnet_link:
+        description: "Magnet link to download"
+        required: true
+        type: string
+
+jobs:
+  fetch-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # just under the 6-hour hard limit
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install -y aria2
+
+      - name: Install Python dependencies
+        run: pip install telethon
+
+      - name: Download torrent and send to Telegram
+        env:
+          MAGNET_LINK: ${{ github.event.inputs.magnet_link }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_TARGET: "me"
+        run: python fetch_and_send.py
