@@ -41,14 +41,14 @@ def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
         print(f"PREVIEW MODE: will stop after ~{PREVIEW_MB}MB of REAL downloaded data")
         _download_with_size_limit(magnet_link)
     else:
-        print(f"Starting full download for: {magnet_link}")
+        print(f"=== DOWNLOADING === {magnet_link}")
         cmd = [
             "aria2c",
             "--seed-time=0",
             "--bt-stop-timeout=60",
             "--max-tries=3",
             "--dir", DOWNLOAD_DIR,
-            "--summary-interval=30",
+            "--summary-interval=15",
             "--console-log-level=warn",
             magnet_link,
         ]
@@ -56,6 +56,7 @@ def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
         if result.returncode != 0:
             print(f"aria2c exited with code {result.returncode}")
             sys.exit(1)
+        print("=== DOWNLOAD DONE ===")
 
 
 def _download_with_size_limit(magnet_link: str) -> None:
@@ -184,7 +185,14 @@ def compress_video(input_path: str) -> str:
     that's visually/aurally very close to the original but noticeably
     smaller. Returns the path to the compressed file, or the original
     path unchanged if compression isn't applicable/fails.
+
+    Prints live progress (% complete, speed, ETA) every few seconds by
+    reading ffmpeg's machine-readable -progress output, so this doesn't
+    look "stuck" for however long the encode takes.
     """
+    import re
+    import time
+
     ext = os.path.splitext(input_path)[1].lower()
     if ext not in VIDEO_EXTENSIONS:
         print(f"Skipping compression for non-video file: {input_path}")
@@ -195,42 +203,98 @@ def compress_video(input_path: str) -> str:
     output_path = os.path.join(COMPRESSED_DIR, f"{base_name}.x265.mp4")
 
     original_mb = os.path.getsize(input_path) / (1024 * 1024)
-    print(f"Compressing {input_path} ({original_mb:.1f} MB) -> x265, CRF {CRF}...")
+
+    # Get total duration first, so we can compute a % complete
+    duration_seconds = _get_video_duration(input_path)
+    dur_str = f"{duration_seconds/60:.1f} min" if duration_seconds else "unknown length"
+    print(f"=== COMPRESSING === {input_path} ({original_mb:.1f} MB, {dur_str}) -> x265, CRF {CRF}")
+    print("(this can take a while — progress updates below every ~10s)")
 
     cmd = [
         "ffmpeg",
         "-i", input_path,
         "-c:v", "libx265",
         "-crf", str(CRF),
-        "-preset", "medium",     # balance of speed vs compression efficiency
+        "-preset", "medium",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-tag:v", "hvc1",        # improves compatibility (Apple devices, some players)
+        "-tag:v", "hvc1",
+        "-progress", "pipe:1",   # machine-readable progress on stdout
+        "-nostats",
         "-y",
         output_path,
     ]
 
+    start_time = time.time()
+    last_print = 0.0
+    current_out_time = 0.0
+    current_speed = ""
+
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             cmd,
-            timeout=COMPRESS_TIMEOUT_SECONDS,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
         )
+
+        for line in process.stdout:
+            line = line.strip()
+            if line.startswith("out_time_ms="):
+                try:
+                    current_out_time = int(line.split("=")[1]) / 1_000_000
+                except ValueError:
+                    pass
+            elif line.startswith("speed="):
+                current_speed = line.split("=")[1]
+
+            now = time.time()
+            if now - last_print >= 10:  # print every ~10 seconds, not every line
+                last_print = now
+                elapsed_min = (now - start_time) / 60
+                if duration_seconds:
+                    pct = min(100, current_out_time / duration_seconds * 100)
+                    eta_min = ((now - start_time) / max(current_out_time, 0.01)) * (duration_seconds - current_out_time) / 60
+                    print(f"  [compress] {pct:.0f}% | speed {current_speed or '?'} | elapsed {elapsed_min:.1f}m | ETA ~{eta_min:.1f}m")
+                else:
+                    print(f"  [compress] {current_out_time/60:.1f} min encoded | speed {current_speed or '?'} | elapsed {elapsed_min:.1f}m")
+
+        returncode = process.wait(timeout=COMPRESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        process.kill()
         print("Compression timed out, sending original file instead.")
         return input_path
 
-    if result.returncode != 0 or not os.path.exists(output_path):
-        print("ffmpeg failed, sending original file instead. Last output:")
-        print(result.stdout[-2000:] if result.stdout else "(no output)")
+    if returncode != 0 or not os.path.exists(output_path):
+        print(f"ffmpeg failed (exit {returncode}), sending original file instead.")
         return input_path
 
     compressed_mb = os.path.getsize(output_path) / (1024 * 1024)
     savings_pct = (1 - compressed_mb / original_mb) * 100 if original_mb else 0
-    print(f"Compressed to {compressed_mb:.1f} MB ({savings_pct:.0f}% smaller)")
+    total_min = (time.time() - start_time) / 60
+    print(f"=== COMPRESSION DONE === {compressed_mb:.1f} MB ({savings_pct:.0f}% smaller), took {total_min:.1f} min")
     return output_path
+
+
+def _get_video_duration(path: str):
+    """Return video duration in seconds using ffprobe, or None if unknown."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return None
 
 
 async def send_files(files, preview_only: bool = False, compressed: bool = False):
@@ -277,6 +341,27 @@ async def send_files(files, preview_only: bool = False, compressed: bool = False
     await client.disconnect()
 
 
+def send_status(message: str) -> None:
+    """Fire-and-forget a short status message to Telegram, so progress is
+    visible from your phone without needing to open the GitHub Actions log.
+    Failures here are non-fatal — never let a status ping crash the job."""
+    try:
+        api_id = int(os.environ["TG_API_ID"])
+        api_hash = os.environ["TG_API_HASH"]
+        session_str = os.environ["TG_SESSION"]
+        target = os.environ.get("TG_TARGET", "me")
+
+        async def _send():
+            client = TelegramClient(StringSession(session_str), api_id, api_hash)
+            await client.start()
+            await client.send_message(target, message)
+            await client.disconnect()
+
+        asyncio.run(_send())
+    except Exception as e:
+        print(f"(status ping failed, continuing anyway: {e})")
+
+
 def main():
     magnet_link = os.environ.get("MAGNET_LINK", "").strip()
     if not magnet_link:
@@ -286,12 +371,17 @@ def main():
     preview_only = os.environ.get("PREVIEW_ONLY", "false").strip().lower() == "true"
     compress = os.environ.get("COMPRESS", "false").strip().lower() == "true"
 
+    mode = "PREVIEW" if preview_only else ("FULL + COMPRESS" if compress else "FULL")
+    send_status(f"🚀 Job started ({mode})\nDownloading torrent now...")
+
     download_torrent(magnet_link, preview_only=preview_only)
     files = find_downloaded_files()
     print(f"Found {len(files)} file(s) to send.")
+    send_status(f"📥 Download complete — {len(files)} file(s) found.")
 
     compressed_applied = False
     if compress and not preview_only:
+        send_status("🎬 Compressing to x265 now — this can take a while, will update when done.")
         new_files = []
         for f in files:
             result_path = compress_video(f)
@@ -299,6 +389,12 @@ def main():
             if result_path != f:
                 compressed_applied = True
         files = new_files
+        if compressed_applied:
+            send_status("✅ Compression done — uploading now.")
+        else:
+            send_status("⚠️ Compression skipped/failed — uploading original file instead.")
+    else:
+        send_status("📤 Uploading now...")
 
     asyncio.run(send_files(files, preview_only=preview_only, compressed=compressed_applied))
 
