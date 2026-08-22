@@ -34,64 +34,134 @@ def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     if preview_only:
-        print(f"PREVIEW MODE: will stop after ~{PREVIEW_MB}MB")
-
-    cmd = [
-        "aria2c",
-        "--seed-time=0",              # don't seed after finishing, just exit
-        "--bt-stop-timeout=60",       # give up if stuck with zero progress for 60s
-        "--max-tries=3",
-        "--dir", DOWNLOAD_DIR,
-        "--summary-interval=30",
-        "--console-log-level=warn",
-        magnet_link,
-    ]
-
-    if preview_only:
-        # aria2 doesn't have a native "stop after N bytes" flag for torrents,
-        # so we run it in a thread and kill it once any file reaches PREVIEW_MB.
-        _download_with_size_limit(cmd)
+        print(f"PREVIEW MODE: will stop after ~{PREVIEW_MB}MB of REAL downloaded data")
+        _download_with_size_limit(magnet_link)
     else:
         print(f"Starting full download for: {magnet_link}")
+        cmd = [
+            "aria2c",
+            "--seed-time=0",
+            "--bt-stop-timeout=60",
+            "--max-tries=3",
+            "--dir", DOWNLOAD_DIR,
+            "--summary-interval=30",
+            "--console-log-level=warn",
+            magnet_link,
+        ]
         result = subprocess.run(cmd, timeout=MAX_WAIT_SECONDS)
-        if result.returncode not in (0, -15):  # -15 = SIGTERM (we sent it), that's fine
+        if result.returncode != 0:
             print(f"aria2c exited with code {result.returncode}")
             sys.exit(1)
 
 
-def _download_with_size_limit(cmd: list) -> None:
-    """Start aria2c and kill it once the largest downloaded file hits PREVIEW_MB."""
+def _download_with_size_limit(magnet_link: str) -> None:
+    """
+    Start aria2c with its RPC interface enabled, and poll RPC for the
+    ACTUAL bytes downloaded (completedLength) rather than checking file
+    size on disk. This matters because aria2 pre-allocates the full file
+    size on disk immediately, so a plain os.path.getsize() check would
+    (incorrectly) look "done" before any real data has arrived.
+    """
     import time
+    import json
     import signal
+    import urllib.request
+
+    RPC_PORT = 6800
+    RPC_URL = f"http://localhost:{RPC_PORT}/jsonrpc"
+    RPC_SECRET = "previewtoken"
+    limit_bytes = PREVIEW_MB * 1024 * 1024
+
+    cmd = [
+        "aria2c",
+        "--enable-rpc",
+        f"--rpc-listen-port={RPC_PORT}",
+        f"--rpc-secret={RPC_SECRET}",
+        "--rpc-listen-all=false",
+        "--seed-time=0",
+        "--bt-stop-timeout=60",
+        "--max-tries=3",
+        "--dir", DOWNLOAD_DIR,
+        "--console-log-level=warn",
+        # Force sequential, front-to-back piece downloading. Without this,
+        # BitTorrent normally grabs pieces in whatever order is fastest/rarest,
+        # which means "10MB downloaded" could be scattered across the middle
+        # and end of the file — useless for a watchable preview.
+        "--bt-prioritize-piece=head=15M",
+        magnet_link,
+    ]
 
     process = subprocess.Popen(cmd)
-    limit_bytes = PREVIEW_MB * 1024 * 1024
+
+    def rpc_call(method, params=None):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "preview",
+            "method": method,
+            "params": [f"token:{RPC_SECRET}"] + (params or []),
+        }
+        req = urllib.request.Request(
+            RPC_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    # Give aria2c a moment to start its RPC server
+    time.sleep(3)
+
     waited = 0
+    while process.poll() is None:
+        time.sleep(3)
+        waited += 3
 
-    while process.poll() is None:  # while aria2 is still running
-        time.sleep(5)
-        waited += 5
+        try:
+            active = rpc_call("aria2.tellActive")
+            results = active.get("result", [])
+            total_completed = sum(
+                int(item.get("completedLength", 0)) for item in results
+            )
+            print(f"  Real bytes downloaded so far: {total_completed / (1024*1024):.1f} MB")
 
-        # Check size of all files downloaded so far
-        all_files = glob.glob(os.path.join(DOWNLOAD_DIR, "**", "*"), recursive=True)
-        partial_files = [f for f in all_files if os.path.isfile(f)]
-        for f in partial_files:
-            try:
-                if os.path.getsize(f) >= limit_bytes:
-                    print(f"Preview size reached on {os.path.basename(f)}, stopping aria2c.")
-                    process.send_signal(signal.SIGTERM)
-                    process.wait(timeout=10)
-                    return
-            except OSError:
-                pass
+            if total_completed >= limit_bytes:
+                print(f"Preview size reached ({total_completed / (1024*1024):.1f} MB), stopping aria2c.")
+                # Find the file path(s) mid-download before we shut aria2 down
+                file_paths = []
+                for item in results:
+                    for f in item.get("files", []):
+                        path = f.get("path")
+                        if path:
+                            file_paths.append(path)
 
-        if waited > 3600:  # 1 hour safety cap for preview mode
+                try:
+                    rpc_call("aria2.shutdown")
+                except Exception:
+                    pass
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=15)
+
+                # aria2 pre-allocates full file size on disk (sparse file).
+                # Truncate down to what was actually downloaded so we don't
+                # upload hundreds of MB of empty padding.
+                for path in file_paths:
+                    if os.path.exists(path):
+                        real_size = min(limit_bytes, os.path.getsize(path))
+                        with open(path, "r+b") as fh:
+                            fh.truncate(real_size)
+                        print(f"Truncated {path} to {real_size / (1024*1024):.1f} MB")
+                return
+        except Exception as e:
+            # RPC might not be up yet in the first couple seconds; keep trying
+            print(f"  (waiting for aria2 RPC: {e})")
+
+        if waited > 3600:
             print("Preview timeout reached, stopping.")
             process.send_signal(signal.SIGTERM)
-            process.wait(timeout=10)
+            process.wait(timeout=15)
             return
 
-    print(f"aria2c finished (exit code {process.returncode})")
+    print(f"aria2c finished on its own (exit code {process.returncode})")
 
 
 def find_downloaded_files():
