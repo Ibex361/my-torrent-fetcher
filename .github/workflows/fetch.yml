@@ -7,6 +7,14 @@ on:
         description: "Magnet link to download"
         required: true
         type: string
+      preview_only:
+        description: "Preview only? (downloads ~10MB so you can check the file before full download)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   fetch-and-send:
@@ -30,6 +38,7 @@ jobs:
       - name: Download torrent and send to Telegram
         env:
           MAGNET_LINK: ${{ github.event.inputs.magnet_link }}
+          PREVIEW_ONLY: ${{ github.event.inputs.preview_only }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION: ${{ secrets.TG_SESSION }}
