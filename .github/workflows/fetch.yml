@@ -15,6 +15,14 @@ on:
         options:
           - "false"
           - "true"
+      compress:
+        description: "Compress video to x265 before sending? (smaller file, same visual quality, slower)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   fetch-and-send:
@@ -29,8 +37,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install aria2
-        run: sudo apt-get update && sudo apt-get install -y aria2
+      - name: Install aria2 and ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y aria2 ffmpeg
 
       - name: Install Python dependencies
         run: pip install telethon
@@ -39,6 +47,7 @@ jobs:
         env:
           MAGNET_LINK: ${{ github.event.inputs.magnet_link }}
           PREVIEW_ONLY: ${{ github.event.inputs.preview_only }}
+          COMPRESS: ${{ github.event.inputs.compress }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION: ${{ secrets.TG_SESSION }}

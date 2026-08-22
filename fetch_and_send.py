@@ -14,6 +14,7 @@ Required environment variables (all passed in as GitHub Actions secrets):
   TG_TARGET       - who to send the file to. Usually "me" (your Saved Messages)
   MAGNET_LINK     - the magnet link to download (passed as workflow input)
   PREVIEW_ONLY    - optional, set to "true" to download only ~10MB as a preview
+  COMPRESS        - optional, set to "true" to re-encode to x265 (HEVC) before sending
 """
 
 import os
@@ -26,8 +27,11 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 DOWNLOAD_DIR = "/home/runner/downloads"
+COMPRESSED_DIR = "/home/runner/compressed"
 MAX_WAIT_SECONDS = 5 * 60 * 60  # leave headroom under the 6-hour job limit
 PREVIEW_MB = 10                  # how many MB to grab in preview mode
+CRF = 22                         # x265 quality: lower = better quality/bigger file. ~20-23 is visually near-lossless
+COMPRESS_TIMEOUT_SECONDS = 4 * 60 * 60  # cap encode time so it can't eat the whole job
 
 
 def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
@@ -171,7 +175,65 @@ def find_downloaded_files():
     return files
 
 
-async def send_files(files, preview_only: bool = False):
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv"}
+
+
+def compress_video(input_path: str) -> str:
+    """
+    Re-encode a video to x265 (HEVC) with AAC audio, at a quality level
+    that's visually/aurally very close to the original but noticeably
+    smaller. Returns the path to the compressed file, or the original
+    path unchanged if compression isn't applicable/fails.
+    """
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext not in VIDEO_EXTENSIONS:
+        print(f"Skipping compression for non-video file: {input_path}")
+        return input_path
+
+    os.makedirs(COMPRESSED_DIR, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    output_path = os.path.join(COMPRESSED_DIR, f"{base_name}.x265.mp4")
+
+    original_mb = os.path.getsize(input_path) / (1024 * 1024)
+    print(f"Compressing {input_path} ({original_mb:.1f} MB) -> x265, CRF {CRF}...")
+
+    cmd = [
+        "ffmpeg",
+        "-i", input_path,
+        "-c:v", "libx265",
+        "-crf", str(CRF),
+        "-preset", "medium",     # balance of speed vs compression efficiency
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-tag:v", "hvc1",        # improves compatibility (Apple devices, some players)
+        "-y",
+        output_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            timeout=COMPRESS_TIMEOUT_SECONDS,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        print("Compression timed out, sending original file instead.")
+        return input_path
+
+    if result.returncode != 0 or not os.path.exists(output_path):
+        print("ffmpeg failed, sending original file instead. Last output:")
+        print(result.stdout[-2000:] if result.stdout else "(no output)")
+        return input_path
+
+    compressed_mb = os.path.getsize(output_path) / (1024 * 1024)
+    savings_pct = (1 - compressed_mb / original_mb) * 100 if original_mb else 0
+    print(f"Compressed to {compressed_mb:.1f} MB ({savings_pct:.0f}% smaller)")
+    return output_path
+
+
+async def send_files(files, preview_only: bool = False, compressed: bool = False):
     api_id = int(os.environ["TG_API_ID"])
     api_hash = os.environ["TG_API_HASH"]
     session_str = os.environ["TG_SESSION"]
@@ -192,7 +254,12 @@ async def send_files(files, preview_only: bool = False):
 
     for f in files:
         size_mb = os.path.getsize(f) / (1024 * 1024)
-        label = "⚠️ PREVIEW (partial file)" if preview_only else "✅ Full file"
+        if preview_only:
+            label = "⚠️ PREVIEW (partial file)"
+        elif compressed:
+            label = "✅ Full file (compressed to x265)"
+        else:
+            label = "✅ Full file"
         print(f"Uploading {f} ({size_mb:.1f} MB)...")
         try:
             await client.send_file(
@@ -217,12 +284,23 @@ def main():
         sys.exit(1)
 
     preview_only = os.environ.get("PREVIEW_ONLY", "false").strip().lower() == "true"
+    compress = os.environ.get("COMPRESS", "false").strip().lower() == "true"
 
     download_torrent(magnet_link, preview_only=preview_only)
     files = find_downloaded_files()
     print(f"Found {len(files)} file(s) to send.")
 
-    asyncio.run(send_files(files, preview_only=preview_only))
+    compressed_applied = False
+    if compress and not preview_only:
+        new_files = []
+        for f in files:
+            result_path = compress_video(f)
+            new_files.append(result_path)
+            if result_path != f:
+                compressed_applied = True
+        files = new_files
+
+    asyncio.run(send_files(files, preview_only=preview_only, compressed=compressed_applied))
 
 
 if __name__ == "__main__":
