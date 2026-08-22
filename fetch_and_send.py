@@ -206,7 +206,9 @@ def compress_video(input_path: str) -> str:
 
     os.makedirs(COMPRESSED_DIR, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    output_path = os.path.join(COMPRESSED_DIR, f"{base_name}.x265.mp4")
+    # MKV instead of MP4: MP4 has poor/no support for most subtitle formats,
+    # so embedded subs would get silently dropped even if we mapped them.
+    output_path = os.path.join(COMPRESSED_DIR, f"{base_name}.x265.mkv")
 
     original_mb = os.path.getsize(input_path) / (1024 * 1024)
 
@@ -216,17 +218,19 @@ def compress_video(input_path: str) -> str:
     dur_str = f"{duration_seconds/60:.1f} min" if duration_seconds else "unknown length"
     print(f"=== COMPRESSING === {input_path} ({original_mb:.1f} MB, {dur_str}) -> x265, CRF {CRF}")
     print("(this can take a while — progress updates below every ~10s)")
-    print("Starting ffmpeg...")
+    print("Starting ffmpeg (keeping subtitles + all audio tracks)...")
 
     cmd = [
         "ffmpeg",
         "-i", input_path,
+        "-map", "0",                # include ALL streams from input: video, every audio track, every subtitle track, chapters
         "-c:v", "libx265",
         "-crf", str(CRF),
         "-preset", "medium",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-tag:v", "hvc1",
+        "-c:s", "copy",             # copy subtitle streams as-is, no re-encoding needed
+        "-max_muxing_queue_size", "9999",  # avoids a common ffmpeg error when muxing multiple stream types
         "-progress", "pipe:1",   # machine-readable progress on stdout
         "-nostats",
         "-y",
