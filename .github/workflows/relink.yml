@@ -1,0 +1,40 @@
+name: Relink Telegram File to Direct Download (auto-expires)
+
+on:
+  workflow_dispatch:
+    inputs:
+      expire_hours:
+        description: "Hours before the link is auto-deleted"
+        required: false
+        default: "3"
+        type: string
+
+jobs:
+  relink-and-expire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # must comfortably exceed expire_hours + upload/download time
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install telethon
+
+      - name: Fetch file, create temp link, wait, then delete
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_TARGET: "me"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # convert hours input -> seconds for the python script
+          HOURS="${{ github.event.inputs.expire_hours }}"
+          export EXPIRE_SECONDS=$(( HOURS * 3600 ))
+          python relink_and_expire.py

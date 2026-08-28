@@ -1,0 +1,68 @@
+name: Fetch Video/Audio (yt-dlp) and Send to Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "URL of the video/page to download"
+        required: true
+        type: string
+      mode:
+        description: "Download video or extract audio only?"
+        required: true
+        default: "video"
+        type: choice
+        options:
+          - "video"
+          - "audio"
+      resolution:
+        description: "Video resolution (only used if mode = video)"
+        required: false
+        default: "720"
+        type: choice
+        options:
+          - "360"
+          - "480"
+          - "720"
+          - "1080"
+          - "best"
+      audio_quality:
+        description: "Audio quality in kbps (only used if mode = audio)"
+        required: false
+        default: "192"
+        type: choice
+        options:
+          - "128"
+          - "192"
+          - "320"
+
+jobs:
+  fetch-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # just under the 6-hour hard limit
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg (needed by yt-dlp for merging/audio extraction)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install telethon yt-dlp
+
+      - name: Download and send to Telegram
+        env:
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+          MODE: ${{ github.event.inputs.mode }}
+          RESOLUTION: ${{ github.event.inputs.resolution }}
+          AUDIO_QUALITY: ${{ github.event.inputs.audio_quality }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_TARGET: "me"
+        run: python ytdlp_and_send.py
