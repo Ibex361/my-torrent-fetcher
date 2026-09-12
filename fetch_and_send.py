@@ -22,6 +22,7 @@ import sys
 import glob
 import subprocess
 import asyncio
+import urllib.parse
 
 # Force unbuffered stdout so print() statements show up immediately in the
 # GitHub Actions log instead of being buffered and appearing in delayed
@@ -40,8 +41,32 @@ CRF = 22                         # x265 quality: lower = better quality/bigger f
 COMPRESS_TIMEOUT_SECONDS = 4 * 60 * 60  # cap encode time so it can't eat the whole job
 
 
+# Well-known public trackers that work over HTTP/HTTPS (i.e. plain TCP/443),
+# appended to every magnet link as a fallback. If GitHub's network drops or
+# throttles UDP (which most BitTorrent trackers and all of DHT rely on),
+# these give aria2 an alternative way to actually find peers.
+HTTP_FALLBACK_TRACKERS = [
+    "https://tracker.opentrackr.org:443/announce",
+    "http://tracker.opentrackr.org:1337/announce",
+    "https://tracker.gbitt.info/announce",
+    "http://tracker.gbitt.info/announce",
+    "https://tracker.tamersunion.org:443/announce",
+    "http://open.acgnxtracker.com:80/announce",
+    "http://tracker.files.fm:6969/announce",
+]
+
+
+def _add_fallback_trackers(magnet_link: str) -> str:
+    """Append HTTP/HTTPS trackers to a magnet link's existing tracker list.
+    Magnet links use repeated &tr= params, so this just adds more."""
+    extra = "".join(f"&tr={urllib.parse.quote(t, safe='')}" for t in HTTP_FALLBACK_TRACKERS)
+    return magnet_link + extra
+
+
 def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    magnet_link = _add_fallback_trackers(magnet_link)
+    print(f"(added {len(HTTP_FALLBACK_TRACKERS)} HTTP/HTTPS fallback trackers for peer-discovery resilience)")
 
     if preview_only:
         print(f"PREVIEW MODE: will stop after ~{PREVIEW_MB}MB of REAL downloaded data")
