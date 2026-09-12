@@ -37,12 +37,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install aria2 and ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y aria2 ffmpeg
+      - name: Set up Node.js (needed for peerflix)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-      - name: Diagnose UDP connectivity (troubleshooting step)
-        run: python3 udp_diagnostic.py
-        continue-on-error: true
+      - name: Install peerflix and ffmpeg
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          npm install -g peerflix
 
       - name: Install Python dependencies
         run: pip install telethon

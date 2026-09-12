@@ -2,7 +2,9 @@
 fetch_and_send.py
 
 Runs inside a GitHub Actions job.
-1. Downloads a torrent (from a magnet link) using aria2.
+1. Downloads a torrent (from a magnet link) using peerflix (pure-JS,
+   no native dependencies — see download_torrent() for why aria2/
+   webtorrent-cli were dropped in favor of this).
 2. Sends the resulting file(s) to your own Telegram account using Telethon
    (a user-account library), which allows uploads up to ~2GB (4GB with
    Telegram Premium) instead of the 50MB limit the normal Bot API has.
@@ -22,7 +24,6 @@ import sys
 import glob
 import subprocess
 import asyncio
-import urllib.parse
 
 # Force unbuffered stdout so print() statements show up immediately in the
 # GitHub Actions log instead of being buffered and appearing in delayed
@@ -41,193 +42,141 @@ CRF = 22                         # x265 quality: lower = better quality/bigger f
 COMPRESS_TIMEOUT_SECONDS = 4 * 60 * 60  # cap encode time so it can't eat the whole job
 
 
-# Well-known public trackers that work over HTTP/HTTPS (i.e. plain TCP/443),
-# appended to every magnet link as a fallback. If GitHub's network drops or
-# throttles UDP (which most BitTorrent trackers and all of DHT rely on),
-# these give aria2 an alternative way to actually find peers.
-HTTP_FALLBACK_TRACKERS = [
-    "https://tracker.opentrackr.org:443/announce",
-    "http://tracker.opentrackr.org:1337/announce",
-    "https://tracker.gbitt.info/announce",
-    "http://tracker.gbitt.info/announce",
-    "https://tracker.tamersunion.org:443/announce",
-    "http://open.acgnxtracker.com:80/announce",
-    "http://tracker.files.fm:6969/announce",
-]
-
-
-def _add_fallback_trackers(magnet_link: str) -> str:
-    """Append HTTP/HTTPS trackers to a magnet link's existing tracker list.
-    Magnet links use repeated &tr= params, so this just adds more."""
-    extra = "".join(f"&tr={urllib.parse.quote(t, safe='')}" for t in HTTP_FALLBACK_TRACKERS)
-    return magnet_link + extra
-
-
 def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
+    """
+    Downloads a torrent using peerflix instead of aria2.
+
+    Why the switch: aria2 repeatedly failed to even fetch torrent metadata
+    for several magnet links on GitHub's runners (stuck at 0 connections,
+    0 bytes downloaded, indefinitely) despite those same torrents having
+    healthy seed counts and downloading instantly from a phone/home network.
+
+    peerflix is a pure-JavaScript BitTorrent client (no native/compiled
+    dependencies, unlike webtorrent-cli's newer versions which currently
+    have a broken native WebRTC addon). It works as a local streaming
+    server: it downloads pieces to a temp buffer directory and serves them
+    over local HTTP. We don't use the streaming/HTTP part at all here —
+    we just let it download to disk and read the finished file directly
+    from its buffer path once done.
+    """
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    magnet_link = _add_fallback_trackers(magnet_link)
-    print(f"(added {len(HTTP_FALLBACK_TRACKERS)} HTTP/HTTPS fallback trackers for peer-discovery resilience)")
 
     if preview_only:
-        print(f"PREVIEW MODE: will stop after ~{PREVIEW_MB}MB of REAL downloaded data")
-        _download_with_size_limit(magnet_link)
+        print(f"PREVIEW MODE: will stop after ~{PREVIEW_MB}MB of downloaded data")
+        _run_peerflix(magnet_link, limit_bytes=PREVIEW_MB * 1024 * 1024)
     else:
-        print(f"=== DOWNLOADING === {magnet_link}")
-        cmd = [
-            "aria2c",
-            "--seed-time=0",
-            "--bt-stop-timeout=180",
-            "--max-tries=3",
-            "--dir", DOWNLOAD_DIR,
-            "--summary-interval=15",
-            "--console-log-level=warn",
-            # --- Peer-discovery resilience flags ---
-            # Some torrents rely mostly on DHT to find peers rather than
-            # trackers. GitHub's runners can be slow/unreliable to bootstrap
-            # into the DHT network over UDP, so we give it more nodes to try
-            # and more time before giving up.
-            "--enable-dht=true",
-            "--enable-dht6=false",
-            "--dht-listen-port=6881-6999",
-            "--bt-enable-lpd=true",           # local peer discovery, harmless extra option
-            "--peer-id-prefix=-TR2940-",       # some trackers/peers are picky about client identity
-            "--bt-request-peer-speed-limit=0",
-            "--bt-tracker-connect-timeout=30",  # give slow trackers more time to respond
-            "--bt-tracker-timeout=30",
-            "--dht-message-timeout=20",
-            magnet_link,
-        ]
-        result = subprocess.run(cmd, timeout=MAX_WAIT_SECONDS)
-        if result.returncode != 0:
-            print(f"aria2c exited with code {result.returncode}")
-            sys.exit(1)
+        print(f"=== DOWNLOADING (peerflix) === {magnet_link}")
+        _run_peerflix(magnet_link, limit_bytes=None)
         print("=== DOWNLOAD DONE ===")
 
 
-def _download_with_size_limit(magnet_link: str) -> None:
+def _run_peerflix(magnet_link: str, limit_bytes) -> None:
     """
-    Start aria2c with its RPC interface enabled, and poll RPC for the
-    ACTUAL bytes downloaded (completedLength) rather than checking file
-    size on disk. This matters because aria2 pre-allocates the full file
-    size on disk immediately, so a plain os.path.getsize() check would
-    (incorrectly) look "done" before any real data has arrived.
+    Runs peerflix, which downloads into a buffer folder and serves it over
+    local HTTP (we ignore the HTTP part). Polls the buffer folder for
+    progress and either:
+      - stops once `limit_bytes` of real data has been written (preview mode), or
+      - waits for peerflix to report the torrent fully downloaded (full mode).
+    Once stopped, copies the resulting file(s) into DOWNLOAD_DIR.
     """
     import time
-    import json
     import signal
-    import urllib.request
+    import re
+    import shutil
+    import select
 
-    RPC_PORT = 6800
-    RPC_URL = f"http://localhost:{RPC_PORT}/jsonrpc"
-    RPC_SECRET = "previewtoken"
-    limit_bytes = PREVIEW_MB * 1024 * 1024
+    buffer_dir = "/home/runner/.peerflix-buffer"
+    os.makedirs(buffer_dir, exist_ok=True)
 
     cmd = [
-        "aria2c",
-        "--enable-rpc",
-        f"--rpc-listen-port={RPC_PORT}",
-        f"--rpc-secret={RPC_SECRET}",
-        "--rpc-listen-all=false",
-        "--seed-time=0",
-        "--bt-stop-timeout=180",
-        "--max-tries=3",
-        "--dir", DOWNLOAD_DIR,
-        "--console-log-level=warn",
-        # --- Peer-discovery resilience flags (see full-download path for why) ---
-        "--enable-dht=true",
-        "--enable-dht6=false",
-        "--dht-listen-port=6881-6999",
-        "--bt-enable-lpd=true",
-        "--peer-id-prefix=-TR2940-",
-        "--bt-request-peer-speed-limit=0",
-        "--bt-tracker-connect-timeout=30",
-        "--bt-tracker-timeout=30",
-        "--dht-message-timeout=20",
-        # Force sequential, front-to-back piece downloading. Without this,
-        # BitTorrent normally grabs pieces in whatever order is fastest/rarest,
-        # which means "10MB downloaded" could be scattered across the middle
-        # and end of the file — useless for a watchable preview.
-        "--bt-prioritize-piece=head=15M",
-        magnet_link,
+        "peerflix", magnet_link,
+        "--path", buffer_dir,
+        "--all",       # download every file in the torrent, not just the biggest
+        "--port", "8888",
     ]
 
-    process = subprocess.Popen(cmd)
-
-    def rpc_call(method, params=None):
-        payload = {
-            "jsonrpc": "2.0",
-            "id": "preview",
-            "method": method,
-            "params": [f"token:{RPC_SECRET}"] + (params or []),
-        }
-        req = urllib.request.Request(
-            RPC_URL,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read())
-
-    # Give aria2c a moment to start its RPC server
-    time.sleep(3)
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
 
     waited = 0
+    last_print = 0.0
+    fully_downloaded = False
+
     while process.poll() is None:
-        time.sleep(3)
-        waited += 3
+        # Non-blocking read: wait up to 1s for output, but always fall through
+        # to the progress/size checks below even if peerflix stays quiet.
+        ready, _, _ = select.select([process.stdout], [], [], 1)
+        if ready:
+            line = process.stdout.readline()
+            if line:
+                line = line.rstrip()
+                if line:
+                    print(line)
+                if re.search(r"100(\.0+)?%", line) or "download complete" in line.lower():
+                    fully_downloaded = True
 
-        try:
-            active = rpc_call("aria2.tellActive")
-            results = active.get("result", [])
-            total_completed = sum(
-                int(item.get("completedLength", 0)) for item in results
-            )
-            print(f"  Real bytes downloaded so far: {total_completed / (1024*1024):.1f} MB")
+        waited += 1
 
-            if total_completed >= limit_bytes:
-                print(f"Preview size reached ({total_completed / (1024*1024):.1f} MB), stopping aria2c.")
-                # Find the file path(s) mid-download before we shut aria2 down
-                file_paths = []
-                for item in results:
-                    for f in item.get("files", []):
-                        path = f.get("path")
-                        if path:
-                            file_paths.append(path)
+        now = time.time()
+        if now - last_print >= 10:
+            last_print = now
+            all_files = glob.glob(os.path.join(buffer_dir, "**", "*"), recursive=True)
+            current_files = [f for f in all_files if os.path.isfile(f)]
+            total_bytes = sum(os.path.getsize(f) for f in current_files)
+            print(f"  [peerflix] {total_bytes / (1024*1024):.1f} MB written so far (elapsed {waited}s)")
 
-                try:
-                    rpc_call("aria2.shutdown")
-                except Exception:
-                    pass
-                process.send_signal(signal.SIGTERM)
-                process.wait(timeout=15)
+            if limit_bytes is not None and total_bytes >= limit_bytes:
+                print(f"Preview size reached ({total_bytes / (1024*1024):.1f} MB), stopping peerflix.")
+                _stop_process(process)
+                break
 
-                # aria2 pre-allocates full file size on disk (sparse file).
-                # Truncate down to what was actually downloaded so we don't
-                # upload hundreds of MB of empty padding.
-                for path in file_paths:
-                    if os.path.exists(path):
-                        real_size = min(limit_bytes, os.path.getsize(path))
-                        with open(path, "r+b") as fh:
-                            fh.truncate(real_size)
-                        print(f"Truncated {path} to {real_size / (1024*1024):.1f} MB")
-                return
-        except Exception as e:
-            # RPC might not be up yet in the first couple seconds; keep trying
-            print(f"  (waiting for aria2 RPC: {e})")
+            if limit_bytes is None and fully_downloaded:
+                print("peerflix reports the download is complete.")
+                _stop_process(process)
+                break
 
-        if waited > 3600:
-            print("Preview timeout reached, stopping.")
-            process.send_signal(signal.SIGTERM)
-            process.wait(timeout=15)
-            return
+        if waited > MAX_WAIT_SECONDS:
+            print("Max wait time reached, stopping peerflix.")
+            _stop_process(process)
+            break
 
-    print(f"aria2c finished on its own (exit code {process.returncode})")
+    # Copy whatever was downloaded into DOWNLOAD_DIR for the rest of the pipeline
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    for f in glob.glob(os.path.join(buffer_dir, "**", "*"), recursive=True):
+        if os.path.isfile(f):
+            rel = os.path.relpath(f, buffer_dir)
+            dest = os.path.join(DOWNLOAD_DIR, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(f, dest)
+
+    # In preview mode, truncate the copied file(s) down to the target size —
+    # peerflix downloads pieces in whatever order it fetches them (not
+    # strictly sequential by default), but for a short preview window this
+    # is very likely to still be front-loaded content; good enough for a
+    # sanity-check preview.
+    if limit_bytes is not None:
+        for f in find_downloaded_files():
+            if os.path.getsize(f) > limit_bytes:
+                with open(f, "r+b") as fh:
+                    fh.truncate(limit_bytes)
+                print(f"Truncated {f} to {limit_bytes / (1024*1024):.1f} MB for preview.")
+
+
+def _stop_process(process) -> None:
+    import signal
+    try:
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+    except Exception:
+        pass
 
 
 def find_downloaded_files():
-    # aria2 also creates .aria2 control files while downloading; ignore those
     all_files = glob.glob(os.path.join(DOWNLOAD_DIR, "**", "*"), recursive=True)
-    files = [f for f in all_files if os.path.isfile(f) and not f.endswith(".aria2")]
+    files = [f for f in all_files if os.path.isfile(f)]
     return files
 
 
