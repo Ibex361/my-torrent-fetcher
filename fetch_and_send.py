@@ -51,11 +51,25 @@ def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
         cmd = [
             "aria2c",
             "--seed-time=0",
-            "--bt-stop-timeout=60",
+            "--bt-stop-timeout=180",
             "--max-tries=3",
             "--dir", DOWNLOAD_DIR,
             "--summary-interval=15",
             "--console-log-level=warn",
+            # --- Peer-discovery resilience flags ---
+            # Some torrents rely mostly on DHT to find peers rather than
+            # trackers. GitHub's runners can be slow/unreliable to bootstrap
+            # into the DHT network over UDP, so we give it more nodes to try
+            # and more time before giving up.
+            "--enable-dht=true",
+            "--enable-dht6=false",
+            "--dht-listen-port=6881-6999",
+            "--bt-enable-lpd=true",           # local peer discovery, harmless extra option
+            "--peer-id-prefix=-TR2940-",       # some trackers/peers are picky about client identity
+            "--bt-request-peer-speed-limit=0",
+            "--bt-tracker-connect-timeout=30",  # give slow trackers more time to respond
+            "--bt-tracker-timeout=30",
+            "--dht-message-timeout=20",
             magnet_link,
         ]
         result = subprocess.run(cmd, timeout=MAX_WAIT_SECONDS)
@@ -90,10 +104,20 @@ def _download_with_size_limit(magnet_link: str) -> None:
         f"--rpc-secret={RPC_SECRET}",
         "--rpc-listen-all=false",
         "--seed-time=0",
-        "--bt-stop-timeout=60",
+        "--bt-stop-timeout=180",
         "--max-tries=3",
         "--dir", DOWNLOAD_DIR,
         "--console-log-level=warn",
+        # --- Peer-discovery resilience flags (see full-download path for why) ---
+        "--enable-dht=true",
+        "--enable-dht6=false",
+        "--dht-listen-port=6881-6999",
+        "--bt-enable-lpd=true",
+        "--peer-id-prefix=-TR2940-",
+        "--bt-request-peer-speed-limit=0",
+        "--bt-tracker-connect-timeout=30",
+        "--bt-tracker-timeout=30",
+        "--dht-message-timeout=20",
         # Force sequential, front-to-back piece downloading. Without this,
         # BitTorrent normally grabs pieces in whatever order is fastest/rarest,
         # which means "10MB downloaded" could be scattered across the middle
