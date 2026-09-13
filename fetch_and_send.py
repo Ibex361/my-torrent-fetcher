@@ -181,6 +181,17 @@ def _run_peerflix(magnet_link: str, limit_bytes) -> None:
                 print(f"Truncated {f} to {limit_bytes / (1024*1024):.1f} MB for preview.")
 
 
+def _stop_process(process) -> None:
+    import signal
+    try:
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+    except Exception:
+        pass
+
+
 def list_torrent_files(magnet_link: str) -> None:
     """
     Connects to qBittorrent, adds the torrent paused, and prints every
@@ -235,20 +246,37 @@ def list_torrent_files(magnet_link: str) -> None:
         print("Magnet submitted, waiting for metadata...")
 
         info_hash = None
-        for _ in range(60):  # up to ~2 minutes to get metadata
+        files = []
+        for attempt in range(60):  # up to ~2 minutes to get metadata + files
             time.sleep(2)
             torrents = json.loads(api_get("/api/v2/torrents/info"))
-            if torrents:
-                info_hash = torrents[0]["hash"]
-                if torrents[0].get("total_size", 0) > 0:
+            if not torrents:
+                continue
+            info_hash = torrents[0]["hash"]
+            if torrents[0].get("total_size", 0) <= 0:
+                continue  # metadata not fetched yet at all
+
+            # total_size > 0 doesn't guarantee the /files endpoint is
+            # populated yet for multi-file torrents — query it directly
+            # and keep retrying until it actually returns entries.
+            try:
+                files_raw = api_get(f"/api/v2/torrents/files?hash={info_hash}")
+                candidate_files = json.loads(files_raw)
+                if candidate_files:
+                    files = candidate_files
+                    print(f"Got file list after {(attempt + 1) * 2}s.")
                     break
+            except Exception:
+                pass
 
         if not info_hash:
             print("Could not fetch torrent metadata in time (no peers responding?).")
             return
 
-        files_raw = api_get(f"/api/v2/torrents/files?hash={info_hash}")
-        files = json.loads(files_raw)
+        if not files:
+            print("Got torrent metadata but the file list came back empty after 2 minutes of retrying.")
+            print("This can happen with unusual torrent structures — try again, or check the torrent itself.")
+            return
 
         print("\n" + "=" * 70)
         print("FILES IN THIS TORRENT:")
@@ -373,19 +401,39 @@ def _run_qbittorrent(magnet_link: str, limit_bytes, file_indices=None) -> None:
         print("Magnet link submitted to qBittorrent.")
 
         info_hash = None
+        all_files = []
         if file_indices:
             print(f"Waiting for metadata to apply file selection: {file_indices}")
-            for _ in range(60):
+            for attempt in range(60):
                 time.sleep(2)
                 torrents = json.loads(api_get("/api/v2/torrents/info", cookie))
-                if torrents and torrents[0].get("total_size", 0) > 0:
-                    info_hash = torrents[0]["hash"]
-                    break
+                if not torrents:
+                    continue
+                candidate_hash = torrents[0]["hash"]
+                if torrents[0].get("total_size", 0) <= 0:
+                    continue
+                try:
+                    candidate_files = json.loads(api_get(f"/api/v2/torrents/files?hash={candidate_hash}", cookie))
+                    if candidate_files:
+                        info_hash = candidate_hash
+                        all_files = candidate_files
+                        print(f"Got file list after {(attempt + 1) * 2}s.")
+                        break
+                except Exception:
+                    pass
 
-            if not info_hash:
-                print("WARNING: could not get metadata in time to apply file selection; downloading everything instead.")
+            if not info_hash or not all_files:
+                print("WARNING: could not get file list in time to apply file selection; downloading everything instead.")
+                # Still need to resume the torrent since we added it paused
+                if info_hash:
+                    resume_body = urllib.parse.urlencode({"hashes": info_hash}).encode()
+                    req = urllib.request.Request(
+                        BASE_URL + "/api/v2/torrents/resume",
+                        data=resume_body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+                    )
+                    urllib.request.urlopen(req, timeout=10)
             else:
-                all_files = json.loads(api_get(f"/api/v2/torrents/files?hash={info_hash}", cookie))
                 selected = set(file_indices)
                 # Set priority 0 (don't download) for everything NOT selected,
                 # priority 1 (normal) for everything selected.
