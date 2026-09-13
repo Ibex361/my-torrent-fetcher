@@ -42,32 +42,50 @@ CRF = 22                         # x265 quality: lower = better quality/bigger f
 COMPRESS_TIMEOUT_SECONDS = 4 * 60 * 60  # cap encode time so it can't eat the whole job
 
 
-def download_torrent(magnet_link: str, preview_only: bool = False) -> None:
+def download_torrent(magnet_link: str, preview_only: bool = False, client: str = "peerflix", file_indices=None) -> None:
     """
-    Downloads a torrent using peerflix instead of aria2.
+    Downloads a torrent using one of three interchangeable backends,
+    selectable via the `client` argument ("peerflix", "qbittorrent", or
+    "transmission"). All three write finished file(s) into DOWNLOAD_DIR
+    so the rest of the pipeline (compression, Telegram upload) doesn't
+    need to know which one ran.
 
-    Why the switch: aria2 repeatedly failed to even fetch torrent metadata
-    for several magnet links on GitHub's runners (stuck at 0 connections,
-    0 bytes downloaded, indefinitely) despite those same torrents having
-    healthy seed counts and downloading instantly from a phone/home network.
+    file_indices: optional set/list of file indices (from list_torrent_files)
+    to selectively download instead of the whole torrent. Only supported
+    with client="qbittorrent" — peerflix and transmission-cli here always
+    grab everything, since selective-file support isn't wired up for them.
 
-    peerflix is a pure-JavaScript BitTorrent client (no native/compiled
-    dependencies, unlike webtorrent-cli's newer versions which currently
-    have a broken native WebRTC addon). It works as a local streaming
-    server: it downloads pieces to a temp buffer directory and serves them
-    over local HTTP. We don't use the streaming/HTTP part at all here —
-    we just let it download to disk and read the finished file directly
-    from its buffer path once done.
+    Why multiple options exist: aria2 repeatedly failed to even fetch
+    torrent metadata for several magnet links on GitHub's runners (stuck
+    at 0 connections, 0 bytes downloaded, indefinitely) despite those same
+    torrents having healthy seed counts and downloading instantly from a
+    phone/home network. peerflix (pure-JS, no native deps) was confirmed
+    to work around this. qBittorrent-nox and transmission-cli are standard,
+    mainstream Ubuntu packages included here as additional options to try
+    — they may turn out faster than peerflix, but unlike peerflix they
+    have not been confirmed against GitHub's specific network behavior
+    yet, so treat a first run with either as a live test.
     """
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    limit_bytes = PREVIEW_MB * 1024 * 1024 if preview_only else None
 
     if preview_only:
         print(f"PREVIEW MODE: will stop after ~{PREVIEW_MB}MB of downloaded data")
-        _run_peerflix(magnet_link, limit_bytes=PREVIEW_MB * 1024 * 1024)
+
+    print(f"=== DOWNLOADING (client: {client}) === {magnet_link}")
+
+    if file_indices and client != "qbittorrent":
+        print(f"NOTE: file_indices selection is only supported with client=qbittorrent; ignoring for {client}.")
+        file_indices = None
+
+    if client == "qbittorrent":
+        _run_qbittorrent(magnet_link, limit_bytes, file_indices=file_indices)
+    elif client == "transmission":
+        _run_transmission(magnet_link, limit_bytes)
     else:
-        print(f"=== DOWNLOADING (peerflix) === {magnet_link}")
-        _run_peerflix(magnet_link, limit_bytes=None)
-        print("=== DOWNLOAD DONE ===")
+        _run_peerflix(magnet_link, limit_bytes)
+
+    print("=== DOWNLOAD DONE ===")
 
 
 def _run_peerflix(magnet_link: str, limit_bytes) -> None:
@@ -163,7 +181,94 @@ def _run_peerflix(magnet_link: str, limit_bytes) -> None:
                 print(f"Truncated {f} to {limit_bytes / (1024*1024):.1f} MB for preview.")
 
 
-def _stop_process(process) -> None:
+def list_torrent_files(magnet_link: str) -> None:
+    """
+    Connects to qBittorrent, adds the torrent paused, and prints every
+    file in it with an index number — used for the 'list files' mode so
+    you can then pick which ones to actually download by number.
+    """
+    import time
+    import json
+    import urllib.request
+    import urllib.parse
+
+    WEBUI_PORT = 8080
+    BASE_URL = f"http://localhost:{WEBUI_PORT}"
+
+    conf_dir = os.path.expanduser("~/.config/qBittorrent")
+    os.makedirs(conf_dir, exist_ok=True)
+    with open(os.path.join(conf_dir, "qBittorrent.conf"), "w") as f:
+        f.write(
+            "[Preferences]\n"
+            "WebUI\\Enabled=true\n"
+            f"WebUI\\Port={WEBUI_PORT}\n"
+            "WebUI\\LocalHostAuth=false\n"
+            "WebUI\\CSRFProtection=false\n"
+            "WebUI\\HostHeaderValidation=false\n"
+        )
+
+    daemon = subprocess.Popen(
+        ["qbittorrent-nox", "--webui-port=" + str(WEBUI_PORT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(8)
+
+    def api_get(path):
+        req = urllib.request.Request(BASE_URL + path)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode()
+
+    try:
+        # Add paused, don't actually download anything yet
+        boundary = "----qbitboundary"
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"urls\"\r\n\r\n{magnet_link}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"paused\"\r\n\r\ntrue\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+        req = urllib.request.Request(
+            BASE_URL + "/api/v2/torrents/add",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        print("Magnet submitted, waiting for metadata...")
+
+        info_hash = None
+        for _ in range(60):  # up to ~2 minutes to get metadata
+            time.sleep(2)
+            torrents = json.loads(api_get("/api/v2/torrents/info"))
+            if torrents:
+                info_hash = torrents[0]["hash"]
+                if torrents[0].get("total_size", 0) > 0:
+                    break
+
+        if not info_hash:
+            print("Could not fetch torrent metadata in time (no peers responding?).")
+            return
+
+        files_raw = api_get(f"/api/v2/torrents/files?hash={info_hash}")
+        files = json.loads(files_raw)
+
+        print("\n" + "=" * 70)
+        print("FILES IN THIS TORRENT:")
+        print("=" * 70)
+        lines = []
+        for i, f in enumerate(files):
+            size_mb = f["size"] / (1024 * 1024)
+            line = f"  [{i}] {f['name']}  ({size_mb:.1f} MB)"
+            print(line)
+            lines.append(line)
+        print("=" * 70)
+
+        send_status(
+            "📋 Files found in this torrent:\n\n" + "\n".join(lines) +
+            "\n\nRun the workflow again with mode=download and file_indices set "
+            "to a comma-separated list of the numbers you want (e.g. \"0,2,5\")."
+        )
+
+    finally:
+        _stop_process(daemon)
     import signal
     try:
         process.send_signal(signal.SIGTERM)
@@ -172,6 +277,304 @@ def _stop_process(process) -> None:
         process.kill()
     except Exception:
         pass
+
+
+def _run_qbittorrent(magnet_link: str, limit_bytes, file_indices=None) -> None:
+    """
+    Runs qbittorrent-nox (headless qBittorrent) via its WebUI HTTP API:
+    start the daemon, log in, add the magnet link, poll progress, stop
+    once done (or once limit_bytes is reached for preview mode), then
+    copy the finished file(s) into DOWNLOAD_DIR.
+
+    NOT YET CONFIRMED against GitHub's network behavior the way peerflix
+    was — qbittorrent-nox is a standard, well-maintained Ubuntu package,
+    so it should install and run correctly, but whether ITS particular
+    peer-discovery approach fares better or worse than aria2's on GitHub's
+    runners is an open question the first real run will answer.
+    """
+    import time
+    import json
+    import shutil
+    import urllib.request
+    import urllib.parse
+
+    WEBUI_PORT = 8080
+    BASE_URL = f"http://localhost:{WEBUI_PORT}"
+    qb_download_dir = "/home/runner/.qbittorrent-downloads"
+    os.makedirs(qb_download_dir, exist_ok=True)
+
+    # LocalHostAuth=false is qBittorrent's own documented setting for
+    # allowing unauthenticated WebUI access from localhost — avoids needing
+    # to construct a PBKDF2 password hash by hand, which is easy to get
+    # subtly wrong and would silently break login.
+    conf_dir = os.path.expanduser("~/.config/qBittorrent")
+    os.makedirs(conf_dir, exist_ok=True)
+    conf_path = os.path.join(conf_dir, "qBittorrent.conf")
+    with open(conf_path, "w") as f:
+        f.write(
+            "[Preferences]\n"
+            "WebUI\\Enabled=true\n"
+            f"WebUI\\Port={WEBUI_PORT}\n"
+            "WebUI\\LocalHostAuth=false\n"
+            "WebUI\\CSRFProtection=false\n"
+            "WebUI\\HostHeaderValidation=false\n"
+        )
+
+    print("Starting qbittorrent-nox...")
+    daemon = subprocess.Popen(
+        ["qbittorrent-nox", "--webui-port=" + str(WEBUI_PORT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(8)  # give the WebUI a moment to come up
+
+    def api_post(path, data=None, cookie=None):
+        req = urllib.request.Request(
+            BASE_URL + path,
+            data=urllib.parse.urlencode(data or {}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded", **({"Cookie": cookie} if cookie else {})},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode(), resp.headers.get("Set-Cookie")
+
+    def api_get(path, cookie):
+        req = urllib.request.Request(BASE_URL + path, headers={"Cookie": cookie} if cookie else {})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode()
+
+    cookie = ""
+    try:
+        # With LocalHostAuth=false, qBittorrent auto-authenticates requests
+        # from 127.0.0.1 without needing a real login — but we still try
+        # the login endpoint first since it's harmless if already trusted.
+        try:
+            _, set_cookie = api_post("/api/v2/auth/login", {"username": "admin", "password": "adminadmin"})
+            if set_cookie:
+                cookie = set_cookie.split(";")[0]
+        except Exception:
+            pass  # fine — LocalHostAuth=false means we don't strictly need this to succeed
+        print("Connected to qBittorrent WebUI.")
+
+        # Add the torrent — paused if we need to select specific files first,
+        # since priorities can only be set once qBittorrent has metadata.
+        add_paused = "true" if file_indices else "false"
+        boundary = "----qbitboundary"
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"urls\"\r\n\r\n{magnet_link}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"savepath\"\r\n\r\n{qb_download_dir}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"paused\"\r\n\r\n{add_paused}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode()
+        req = urllib.request.Request(
+            BASE_URL + "/api/v2/torrents/add",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Cookie": cookie},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        print("Magnet link submitted to qBittorrent.")
+
+        info_hash = None
+        if file_indices:
+            print(f"Waiting for metadata to apply file selection: {file_indices}")
+            for _ in range(60):
+                time.sleep(2)
+                torrents = json.loads(api_get("/api/v2/torrents/info", cookie))
+                if torrents and torrents[0].get("total_size", 0) > 0:
+                    info_hash = torrents[0]["hash"]
+                    break
+
+            if not info_hash:
+                print("WARNING: could not get metadata in time to apply file selection; downloading everything instead.")
+            else:
+                all_files = json.loads(api_get(f"/api/v2/torrents/files?hash={info_hash}", cookie))
+                selected = set(file_indices)
+                # Set priority 0 (don't download) for everything NOT selected,
+                # priority 1 (normal) for everything selected.
+                for i in range(len(all_files)):
+                    priority = "1" if i in selected else "0"
+                    prio_body = urllib.parse.urlencode({
+                        "hash": info_hash, "id": str(i), "priority": priority
+                    }).encode()
+                    req = urllib.request.Request(
+                        BASE_URL + "/api/v2/torrents/filePrio",
+                        data=prio_body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+                    )
+                    urllib.request.urlopen(req, timeout=10)
+                print(f"Applied file selection: downloading {len(selected)}/{len(all_files)} files.")
+
+                # Now resume the torrent since we added it paused
+                resume_body = urllib.parse.urlencode({"hashes": info_hash}).encode()
+                req = urllib.request.Request(
+                    BASE_URL + "/api/v2/torrents/resume",
+                    data=resume_body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+                )
+                urllib.request.urlopen(req, timeout=10)
+
+        waited = 0
+        last_print = 0.0
+        while waited < MAX_WAIT_SECONDS:
+            time.sleep(3)
+            waited += 3
+
+            try:
+                info_raw = api_get("/api/v2/torrents/info", cookie)
+                torrents = json.loads(info_raw)
+            except Exception as e:
+                print(f"  (waiting for qBittorrent API: {e})")
+                continue
+
+            if not torrents:
+                continue
+
+            t = torrents[0]
+            downloaded = t.get("downloaded", 0)
+            progress_pct = t.get("progress", 0) * 100
+            state = t.get("state", "?")
+
+            now = time.time()
+            if now - last_print >= 10:
+                last_print = now
+                print(f"  [qbittorrent] {progress_pct:.1f}% | {downloaded / (1024*1024):.1f} MB | state={state}")
+
+            if limit_bytes is not None and downloaded >= limit_bytes:
+                print(f"Preview size reached ({downloaded / (1024*1024):.1f} MB), stopping.")
+                break
+
+            if limit_bytes is None and state in ("uploading", "stalledUP", "queuedUP", "pausedUP", "forcedUP"):
+                print("qBittorrent reports the download is complete (now seeding).")
+                break
+
+    finally:
+        try:
+            api_post("/api/v2/app/shutdown", cookie=cookie)
+        except Exception:
+            pass
+        _stop_process(daemon)
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    for f in glob.glob(os.path.join(qb_download_dir, "**", "*"), recursive=True):
+        if os.path.isfile(f):
+            rel = os.path.relpath(f, qb_download_dir)
+            dest = os.path.join(DOWNLOAD_DIR, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(f, dest)
+
+    if limit_bytes is not None:
+        for f in find_downloaded_files():
+            if os.path.getsize(f) > limit_bytes:
+                with open(f, "r+b") as fh:
+                    fh.truncate(limit_bytes)
+                print(f"Truncated {f} to {limit_bytes / (1024*1024):.1f} MB for preview.")
+
+
+def _run_transmission(magnet_link: str, limit_bytes) -> None:
+    """
+    Runs transmission-daemon + transmission-remote (the CLI control tool)
+    to add a magnet link, poll progress, and stop once done or once
+    limit_bytes is reached, then copies the finished file(s) into
+    DOWNLOAD_DIR.
+
+    NOT YET CONFIRMED against GitHub's network behavior — see the note in
+    _run_qbittorrent for why.
+    """
+    import time
+    import shutil
+    import re
+
+    tr_download_dir = "/home/runner/.transmission-downloads"
+    os.makedirs(tr_download_dir, exist_ok=True)
+
+    print("Starting transmission-daemon...")
+    # The apt package can auto-start a system transmission-daemon service;
+    # stop it first so it doesn't conflict with our own foreground instance
+    # on the same port.
+    subprocess.run(["sudo", "systemctl", "stop", "transmission-daemon"], capture_output=True)
+    subprocess.run(["sudo", "pkill", "-f", "transmission-daemon"], capture_output=True)
+    import time as _time
+    _time.sleep(2)
+
+    daemon = subprocess.Popen(
+        [
+            "transmission-daemon",
+            "--foreground",
+            "--download-dir", tr_download_dir,
+            "--no-auth",
+            "--allowed", "127.0.0.1,localhost",
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(5)
+
+    try:
+        add_result = subprocess.run(
+            ["transmission-remote", "localhost", "--add", magnet_link],
+            capture_output=True, text=True, timeout=15,
+        )
+        print(add_result.stdout.strip())
+        if add_result.returncode != 0:
+            raise RuntimeError(f"Failed to add torrent: {add_result.stderr}")
+
+        waited = 0
+        last_print = 0.0
+        while waited < MAX_WAIT_SECONDS:
+            time.sleep(3)
+            waited += 3
+
+            status = subprocess.run(
+                ["transmission-remote", "localhost", "--torrent", "all", "--info"],
+                capture_output=True, text=True, timeout=15,
+            )
+            output = status.stdout
+
+            # Parse "Percent Done: NN%" and "Have: X MB" style lines
+            pct_match = re.search(r"Percent Done:\s*([\d.]+)%", output)
+            have_match = re.search(r"Have:\s*([\d.]+)\s*(MB|GB|KB)", output)
+            state_match = re.search(r"State:\s*(.+)", output)
+
+            pct = float(pct_match.group(1)) if pct_match else 0.0
+            state = state_match.group(1).strip() if state_match else "?"
+
+            have_bytes = 0
+            if have_match:
+                val, unit = float(have_match.group(1)), have_match.group(2)
+                multiplier = {"KB": 1024, "MB": 1024**2, "GB": 1024**3}[unit]
+                have_bytes = val * multiplier
+
+            now = time.time()
+            if now - last_print >= 10:
+                last_print = now
+                print(f"  [transmission] {pct:.1f}% | {have_bytes / (1024*1024):.1f} MB | state={state}")
+
+            if limit_bytes is not None and have_bytes >= limit_bytes:
+                print(f"Preview size reached ({have_bytes / (1024*1024):.1f} MB), stopping.")
+                break
+
+            if limit_bytes is None and pct >= 100.0:
+                print("Transmission reports the download is complete.")
+                break
+
+    finally:
+        try:
+            subprocess.run(["transmission-remote", "localhost", "--exit"], capture_output=True, timeout=10)
+        except Exception:
+            pass
+        _stop_process(daemon)
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    for f in glob.glob(os.path.join(tr_download_dir, "**", "*"), recursive=True):
+        if os.path.isfile(f):
+            rel = os.path.relpath(f, tr_download_dir)
+            dest = os.path.join(DOWNLOAD_DIR, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(f, dest)
+
+    if limit_bytes is not None:
+        for f in find_downloaded_files():
+            if os.path.getsize(f) > limit_bytes:
+                with open(f, "r+b") as fh:
+                    fh.truncate(limit_bytes)
+                print(f"Truncated {f} to {limit_bytes / (1024*1024):.1f} MB for preview.")
 
 
 def find_downloaded_files():
@@ -395,14 +798,30 @@ def main():
 
     preview_only = os.environ.get("PREVIEW_ONLY", "false").strip().lower() == "true"
     compress = os.environ.get("COMPRESS", "false").strip().lower() == "true"
+    client = os.environ.get("CLIENT", "peerflix").strip().lower()
+    action = os.environ.get("ACTION", "download").strip().lower()  # "download" or "list_files"
+
+    file_indices = None
+    raw_indices = os.environ.get("FILE_INDICES", "").strip()
+    if raw_indices:
+        try:
+            file_indices = {int(x.strip()) for x in raw_indices.split(",") if x.strip() != ""}
+        except ValueError:
+            print(f"Could not parse FILE_INDICES={raw_indices!r}, ignoring (must be comma-separated numbers).")
+
+    if action == "list_files":
+        send_status(f"🔎 Listing files in this torrent using qbittorrent...")
+        list_torrent_files(magnet_link)
+        return
 
     mode = "PREVIEW" if preview_only else ("FULL + COMPRESS" if compress else "FULL")
-    send_status(f"🚀 Job started ({mode})\nDownloading torrent now...")
+    files_note = f"\nDownloading {len(file_indices)} selected file(s)." if file_indices else ""
+    send_status(f"🚀 Job started ({mode})\nTool: {client}\nDownloading torrent now...{files_note}")
 
-    download_torrent(magnet_link, preview_only=preview_only)
+    download_torrent(magnet_link, preview_only=preview_only, client=client, file_indices=file_indices)
     files = find_downloaded_files()
     print(f"Found {len(files)} file(s) to send.")
-    send_status(f"📥 Download complete — {len(files)} file(s) found.")
+    send_status(f"📥 Download complete ({client}) — {len(files)} file(s) found.")
 
     compressed_applied = False
     if compress and not preview_only:

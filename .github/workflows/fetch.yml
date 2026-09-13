@@ -7,6 +7,28 @@ on:
         description: "Magnet link to download"
         required: true
         type: string
+      action:
+        description: "List files in the torrent first, or download directly?"
+        required: false
+        default: "download"
+        type: choice
+        options:
+          - "download"
+          - "list_files"
+      client:
+        description: "Which torrent client to use"
+        required: false
+        default: "peerflix"
+        type: choice
+        options:
+          - "peerflix"
+          - "qbittorrent"
+          - "transmission"
+      file_indices:
+        description: "Only for qbittorrent: comma-separated file numbers to download (from list_files output), e.g. 0,2,5. Leave blank for all files."
+        required: false
+        default: ""
+        type: string
       preview_only:
         description: "Preview only? (downloads ~10MB so you can check the file before full download)"
         required: false
@@ -42,9 +64,10 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install peerflix and ffmpeg
+      - name: Install torrent clients and ffmpeg
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg qbittorrent-nox transmission-cli transmission-daemon
           npm install -g peerflix
 
       - name: Install Python dependencies
@@ -53,6 +76,9 @@ jobs:
       - name: Download torrent and send to Telegram
         env:
           MAGNET_LINK: ${{ github.event.inputs.magnet_link }}
+          ACTION: ${{ github.event.inputs.action }}
+          CLIENT: ${{ github.event.inputs.client }}
+          FILE_INDICES: ${{ github.event.inputs.file_indices }}
           PREVIEW_ONLY: ${{ github.event.inputs.preview_only }}
           COMPRESS: ${{ github.event.inputs.compress }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
